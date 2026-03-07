@@ -1,0 +1,12 @@
+.claude/
+data/
+logs/
+models/
+results/
+runs/
+temp/
+*.ckpt
+*.log
+*.pt
+*.pth
+venv/
