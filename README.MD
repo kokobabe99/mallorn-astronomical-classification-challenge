@@ -92,16 +92,85 @@ After cross-validation, we perform a **grid search on OOF predictions** to find:
 
 This jointly maximizes the F1 score on the full training set's OOF predictions.
 
-## Ablation Studies
+## Experiments & Results
 
-| Variant | Change | Impact |
+We explored multiple approaches, progressively improving the pipeline. All scores are F1 on Kaggle's private/public leaderboard.
+
+### Approach 1: Baseline Ensemble (LightGBM + XGBoost + ExtraTrees)
+
+- **Features**: ~150 hand-crafted features (global flux statistics, temporal features, variability indices, per-filter features, color features, cross-filter timing, metadata interactions)
+- **Models**: LightGBM, XGBoost, ExtraTrees with 5-fold stratified CV
+- **Ensemble**: Grid search over ensemble weights + threshold optimization on OOF predictions
+- **No oversampling**
+
+| Submission | Private Score | Public Score |
 |---|---|---|
-| v1 (2-model) vs v2 (3-model) | Added ExtraTrees to ensemble | Improved F1 by providing diversity; tree-based randomness complements gradient boosting |
-| Basic features vs enhanced features | Added Stetson J, Von Neumann, rise/decline, per-filter peak phase, cross-filter timing | Significant F1 improvement — variability indices capture TDE-specific temporal signatures |
-| Fixed weights (0.5/0.5) vs optimized weights | Grid search over ensemble weights | Small but consistent gain from adaptive weighting |
-| Fixed threshold (0.5) vs optimized threshold | Threshold search on OOF | Critical for imbalanced data — optimal threshold is typically much lower than 0.5 |
-| With vs without metadata interactions | Flux/redshift interaction features | Moderate improvement — physical quantities normalized by distance are more meaningful |
-| 5-fold vs 10-fold CV | Number of cross-validation folds | 5-fold chosen for stability given the small number of TDEs per fold |
+| Ensemble (weight-optimized) | 0.5268 | 0.5539 |
+
+### Approach 2: Enhanced Features + Stacking + SMOTE
+
+- **Features**: ~267 features — added Bazin function fits, structure function, autocorrelation, flux asymmetry, rolling statistics, Stetson K index
+- **Models**: LightGBM, XGBoost, CatBoost, ExtraTrees, BalancedRandomForest (5-model)
+- **SMOTE** oversampling (k=3) within each CV fold
+- **Stacking**: Logistic Regression meta-learner on base model outputs
+- **10-fold CV** with nested CV threshold selection
+
+> This approach did not yield a clear improvement over Approach 1, likely due to feature noise from the larger feature set and potential overfitting with 5 models on a small TDE sample.
+
+### Approach 3: Feature Selection + Optuna Tuning + Pseudo-Labeling
+
+- **Features**: Top 60 features selected via multi-seed LightGBM importance (seeds: 42, 123, 456) — reduced noise from the 267-feature set
+- **Models**: LightGBM, XGBoost, CatBoost (focused 3-model ensemble, dropped weaker models)
+- **Optuna** Bayesian hyperparameter tuning: 50 trials per model
+- **SMOTE** (k=3) within 10-fold CV
+- **Pseudo-Labeling**: 2 rounds of self-training on high-confidence test predictions
+  - Round 1: pos ≥ 0.90, neg ≤ 0.05
+  - Round 2: pos ≥ 0.85, neg ≤ 0.08
+- **Nested CV** threshold selection (median from 5-fold inner CV)
+
+| Submission | Private Score | Public Score |
+|---|---|---|
+| **3-Model Ensemble** | **0.5481** | **0.5643** |
+| **Pseudo-Label Round 2** | **0.5481** | **0.5643** |
+| Pseudo-Label Round 1 | 0.5443 | 0.5505 |
+| XGBoost (single model) | 0.5358 | 0.5438 |
+| LightGBM (single model) | 0.5230 | 0.5340 |
+| Base Ensemble (nested CV threshold) | 0.5212 | 0.5340 |
+| CatBoost (single model) | 0.4664 | 0.5073 |
+
+### Approach 4: MLP + Multi-Seed Blending
+
+- **Features**: Same top 60 features as Approach 3, with StandardScaler for MLP
+- **Models**: LightGBM, XGBoost, CatBoost, **MLP** (scikit-learn MLPClassifier, 2-3 hidden layers)
+- **Multi-seed blending**: Each model trained with 3 seeds (42, 123, 456) × 10-fold CV, predictions averaged across seeds for stability
+- **Optuna** tuning for all 4 models (40-50 trials each)
+- **Pseudo-Labeling**: 2 rounds (same thresholds as Approach 3)
+
+| Submission | Private Score | Public Score |
+|---|---|---|
+| MLP (single model) | 0.4573 | 0.4545 |
+
+> MLP underperformed tree-based models significantly. Multi-seed blending added training cost without improving over Approach 3's focused ensemble.
+
+### Summary
+
+| Approach | Best Private Score | Key Technique |
+|---|---|---|
+| Baseline Ensemble | 0.5268 | Weight-optimized 3-model ensemble |
+| Enhanced Features + Stacking | ~0.5268 | SMOTE + 5-model stacking |
+| **Feature Selection + Optuna + PL** | **0.5481** | Feature selection + HPO + pseudo-labeling |
+| MLP + Multi-Seed | 0.4573 | Neural network + multi-seed blending |
+
+**Best result: F1 = 0.5481** (Private) achieved by the Approach 3 ensemble and its pseudo-labeled variant.
+
+### Key Takeaways
+
+- **Feature selection > feature quantity**: Reducing from 267 to 60 features improved generalization
+- **Hyperparameter tuning matters**: Optuna-tuned models significantly outperformed manually-tuned ones
+- **Pseudo-labeling helped slightly**: Round 2 matched the base ensemble; Round 1 was close
+- **Tree-based models dominate**: XGBoost was the strongest single model; MLP was the weakest
+- **CatBoost underperformed** relative to LightGBM and XGBoost on this task
+- **Threshold optimization is critical** for imbalanced classification — optimal threshold was far below 0.5
 
 ## Project Structure
 
@@ -114,32 +183,17 @@ mallorn-astronomical-classification-challenge/
 │   └── split_01/ ... split_20/          # Light curve data
 │       ├── train_full_lightcurves.csv
 │       └── test_full_lightcurves.csv
-├── main.py                              # v1: LightGBM + XGBoost baseline
-├── main_v2.py                           # v2: 3-model ensemble with enhanced features
-├── mallorn_classification.ipynb         # Full Kaggle notebook with EDA & visualizations
-├── submission.csv                       # Generated submission file
+├── mallorn_classification.ipynb         # Approach 1: Baseline ensemble
+├── mallorn_classification_v2.ipynb      # Approach 2: Enhanced features + stacking
+├── mallorn_classification_v3.ipynb      # Approach 3: Feature selection + Optuna + PL
+├── mallorn_classification_v4.ipynb      # Approach 4: MLP + multi-seed blending
 ├── requirements.txt                     # Python dependencies
 └── README.MD
 ```
 
 ## How to Run
 
-### Local Execution
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run v1 (baseline)
-python main.py
-
-# Run v2 (improved)
-python main_v2.py
-```
-
-### Kaggle Submission
-
-Upload and run `mallorn_classification.ipynb` on Kaggle with the competition dataset attached. The notebook includes EDA visualizations, full training pipeline, and submission generation.
+Upload and run any notebook on Kaggle with the competition dataset attached. Each notebook includes EDA, full training pipeline, and submission generation.
 
 ## Dependencies
 

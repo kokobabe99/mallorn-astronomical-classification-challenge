@@ -10,3 +10,5 @@ temp/
 *.pt
 *.pth
 venv/
+*.csv
+.DS_Store
