@@ -19,6 +19,60 @@ Each object has:
 - **Metadata**: redshift (`Z`, `Z_err`), extinction (`EBV`), spectral type (`SpecType`)
 - **Light curves**: multi-band (u, g, r, i, z, y) time-series photometry split across 20 data files, with columns `object_id`, `Time (MJD)`, `Filter`, `Flux`, `Flux_err`
 
+## Data Parsing
+
+The competition data is split into two parts: **metadata** and **light curves**.
+
+### Metadata
+
+Two CSV files at the top level:
+
+- `train_log.csv` — 3,043 training objects with columns:
+  - `object_id`: unique Tolkien-themed identifier (e.g. `Dornhoth_fervain_onodrim`)
+  - `Z`, `Z_err`: redshift and its uncertainty (Z_err is missing for some objects)
+  - `EBV`: dust extinction value
+  - `SpecType`: spectral type — `AGN`, `SN II`, or `TDE`
+  - `split`: which data split the light curve belongs to (`split_01` ... `split_20`)
+  - `target`: binary label (1 = TDE, 0 = non-TDE)
+
+- `test_log.csv` — 7,135 test objects with the same columns (except `target`)
+
+### Light Curves
+
+Light curve data is distributed across 20 subdirectories (`split_01/` to `split_20/`), each containing:
+- `train_full_lightcurves.csv`
+- `test_full_lightcurves.csv`
+
+Each light curve file has columns:
+- `object_id`: links back to the metadata
+- `Time (MJD)`: observation timestamp in Modified Julian Date
+- `Flux`: measured brightness
+- `Flux_err`: flux measurement uncertainty
+- `Filter`: LSST photometric band — one of `u`, `g`, `r`, `i`, `z`, `y`
+
+Each split file contains ~26K (train) or ~59K (test) observation rows. To reconstruct a complete dataset, all 20 splits must be concatenated:
+
+```python
+train_log = pd.read_csv("data/train_log.csv")
+test_log = pd.read_csv("data/test_log.csv")
+
+train_lcs, test_lcs = [], []
+for i in range(1, 21):
+    d = f"data/split_{i:02d}"
+    train_lcs.append(pd.read_csv(f"{d}/train_full_lightcurves.csv"))
+    test_lcs.append(pd.read_csv(f"{d}/test_full_lightcurves.csv"))
+
+train_lc = pd.concat(train_lcs, ignore_index=True)
+test_lc = pd.concat(test_lcs, ignore_index=True)
+```
+
+Each `object_id` has multi-band time-series observations. To get a single object's light curve:
+
+```python
+obj_lc = train_lc[train_lc["object_id"] == "Dornhoth_fervain_onodrim"]
+# Filter by band: obj_lc[obj_lc["Filter"] == "g"]
+```
+
 ## Methodology
 
 ### 1. Feature Engineering
