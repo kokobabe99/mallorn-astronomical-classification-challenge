@@ -150,6 +150,12 @@ This jointly maximizes the F1 score on the full training set's OOF predictions.
 
 We explored multiple approaches, progressively improving the pipeline. All scores are F1 on Kaggle's private/public leaderboard.
 
+### Kaggle Submission Results
+
+![Kaggle Submissions](doc/Snipaste_2026-03-08_22-47-25.png)
+
+> Kaggle Profile: [jackieveloped](https://www.kaggle.com/jackieveloped)
+
 ### Approach 1: Baseline Ensemble (LightGBM + XGBoost + ExtraTrees)
 
 - **Features**: ~150 hand-crafted features (global flux statistics, temporal features, variability indices, per-filter features, color features, cross-filter timing, metadata interactions)
