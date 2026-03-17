@@ -77,74 +77,79 @@ obj_lc = train_lc[train_lc["object_id"] == "Dornhoth_fervain_onodrim"]
 
 ### 1. Feature Engineering
 
-We extract **190+ features** from each object's light curve across several categories:
+The final approach (Approach 5) extracts **1,300+ features** from each object's light curve through a comprehensive pipeline:
 
-**Global Flux Statistics (16 features)**
-- Mean, std, median, min, max, range, skewness, kurtosis
-- Percentiles (P10, P90), IQR, MAD (median absolute deviation)
-- Fraction of observations above mean, fraction with positive flux
-- Inverse-variance weighted mean
+**Data Augmentation (Channel Injection)**
+- **SNR channels**: 6 virtual bands computed as `Flux / Flux_err`, capturing signal quality variation
+- **Normalized Shape channels**: 6 bands normalized by per-band amplitude (`Flux / (max - min)`), isolating shape from brightness
+- This expands the original 6 bands to **18+ channels** for feature extraction
 
-**Error & Signal-to-Noise Features (6 features)**
-- Flux error mean, std, median
-- SNR mean, max, std
+**Per-Band Features (computed per filter, then pivoted across all channels)**
+- Statistical features: max, mean, std, observation count, time span
+- Resampled signal features: FFT power spectrum (mean, dominant frequency), rolling std, skewness
+- Physical binning: flux mean and skewness in 8 time bins centered on peak
+- Advanced shape: kurtosis, quantile ratios (Q90/Q50, Q100/Q50)
+- Gradient features: max rise/decay rate, rise-decay ratio, mean acceleration
+- Power-law decay fit: log-log regression on post-peak decay (motivated by TDE t^-5/3 theory)
+- Lomb-Scargle periodogram: dominant period power, frequency, and power ratio
+- Integral features: total flux area, rise/decay area, area ratio and spread
+- Luminosity features: flux converted to absolute luminosity using cosmological distance
 
-**Temporal Features (10 features)**
-- Time span, cadence statistics (dt mean, std, min, max)
-- Flux rate of change: mean, std, max, min, absolute max
-- Fraction of positive flux rate (rising vs falling)
+**Global/Cross-Band Features**
+- TDE asymmetry ratio: rise time vs decline time
+- Robust stacked features: multi-band normalized stacking with Savitzky-Golay smoothing, extracting FWHM, rise/decay slopes, smoothness
+- Color features: time-matched flux differences across 9 band pairs, computed for all channel types (flux, SNR, normalized, SNR-normalized)
+- Rest-frame kinematics: kinematic features corrected for cosmological time dilation and luminosity distance
 
-**Peak Analysis (7 features)**
-- Peak flux, peak phase (relative timing), peak time from start
-- Rise rate, rise duration, decline rate, decline duration
-- Rise-to-decline duration ratio
+**Metadata Interactions**
+- Flux statistics divided by redshift, Z x EBV, log transforms, missing value indicators
 
-**Variability Indices (4 features)**
-- Stetson J index — detects correlated variability across consecutive observations
-- Von Neumann ratio — measures time-series smoothness
-- Excess variance — intrinsic variability beyond measurement noise
-- Number of peaks (via `scipy.signal.find_peaks`)
+### 2. Multi-Track GBDT Army
 
-**Per-Filter Features (17 features x 6 filters = 102 features)**
-- For each of the 6 LSST bands (u, g, r, i, z, y): count, mean, std, max, min, range, skewness, kurtosis, SNR, weighted mean, MAD, P10, P90, positive fraction, max rate, mean rate, peak phase, Stetson J
+Instead of a single model configuration, I train a **"GBDT army"** — multiple tracks with diverse hyperparameters to maximize ensemble diversity:
 
-**Color Features (18 features)**
-- Mean flux differences between band pairs: (u,g), (g,r), (r,i), (i,z), (z,y), (g,i), (u,r), (r,z)
-- Peak flux differences between the same band pairs
-- Color variability: range differences in (g-r) and (r-i)
+| Diversity Axis | Variations |
+|---|---|
+| `scale_pos_weight` | 12, 15, 16, 18, 20 |
+| Random seed | Different seeds per track |
+| Evaluation metric | Binary logloss vs AUC |
+| Learning rate | Fast (0.05) vs Slow (0.03) |
 
-**Cross-Filter Timing (3 features)**
-- Peak delay between bands: (g,r), (r,i), (i,z) — characteristic of physical processes with wavelength-dependent emission
+Each track contains **4 model types**:
+- **XGBoost** — histogram-based gradient boosting
+- **LightGBM** — leaf-wise gradient boosting
+- **CatBoost** — ordered boosting with symmetric trees
+- **ExtraTrees** — randomized splits for complementary diversity
 
-**Metadata Interaction Features (8 features)**
-- Flux mean/range/amplitude/peak divided by redshift
-- Z × EBV, log(flux range), log(peak flux), has_z_err binary indicator
+With 9 tracks × 4 models × 5 folds = **180 GBDT models** total. Each track's 4 models are blended (XGB 0.4, CatBoost 0.3, LGB 0.2, ET 0.1), then all tracks are combined.
 
-### 2. Model Ensemble
+### 3. 1D CNN-LSTM on Raw Light Curves
 
-We use a **3-model ensemble** to maximize prediction diversity:
+To provide genuine architectural diversity beyond tree-based models, I train a **1D CNN-LSTM** directly on the resampled multi-band time series:
 
-| Model | Type | Key Config |
-|-------|------|------------|
-| **LightGBM** | Gradient Boosting | lr=0.02, max_depth=7, 31 leaves, 3000 rounds |
-| **XGBoost** | Gradient Boosting | lr=0.02, max_depth=7, 3000 rounds |
-| **ExtraTrees** | Random Forest variant | 500 trees, max_depth=10, balanced class weights |
+- **Input**: 12-channel tensor (6 flux bands + 6 SNR bands), each resampled to 150 uniform time steps with per-channel normalization
+- **Architecture**: Multi-scale Inception convolution (kernel 3/7/15) → Conv blocks → Bidirectional LSTM → Attention pooling → Classifier
+- **Training**: AdamW optimizer, CosineAnnealingWarmRestarts scheduler, BCEWithLogitsLoss with pos_weight, gradient clipping
+- 5-fold CV, 50 epochs per fold
 
-All models use `scale_pos_weight` (or `class_weight="balanced"`) to handle the severe class imbalance.
+### 4. Hill Climbing Weight Optimization
 
-### 3. Cross-Validation
+Rather than grid search, I use **simulated annealing hill climbing** (2000 iterations) to find optimal blend weights across all GBDT tracks and the DL model. This explores a much larger weight space than exhaustive grid search.
+
+### 5. Disagreement-Based Regional Thresholding
+
+The key insight is that **samples where models disagree need different treatment**:
+
+1. Compute pairwise disagreement between model predictions (GBDT vs DL, or inter-track differences)
+2. Split samples into Low / Mid / High disagreement regions with optimized boundaries
+3. Optimize classification threshold **independently per region** on OOF predictions
+4. Apply hard-rule arbitration: when models have extreme disagreement (>0.5) and one model has very low confidence (<0.05), conservatively predict negative
+
+### 6. Cross-Validation
 
 - **5-fold Stratified K-Fold** ensures each fold preserves the TDE class ratio
 - Each model produces out-of-fold (OOF) predictions used for ensemble optimization
-- Early stopping (patience=150 rounds) for LightGBM and XGBoost
-
-### 4. Ensemble Weight & Threshold Optimization
-
-After cross-validation, we perform a **grid search on OOF predictions** to find:
-- **Optimal ensemble weights**: searched over `w_lgb`, `w_xgb`, `w_et` combinations (step=0.1)
-- **Optimal classification threshold**: searched from 0.05 to 0.80 (step=0.005)
-
-This jointly maximizes the F1 score on the full training set's OOF predictions.
+- Early stopping (patience=150 rounds) for all gradient boosting models
 
 ## Experiments & Results
 
@@ -152,7 +157,7 @@ We explored multiple approaches, progressively improving the pipeline. All score
 
 ### Kaggle Submission Results
 
-![Kaggle Submissions](doc/Snipaste_2026-03-08_22-47-25.png)
+![Kaggle Submissions](doc/image.png)
 
 > Kaggle Profile: [jackieveloped](https://www.kaggle.com/jackieveloped)
 
@@ -184,8 +189,8 @@ We explored multiple approaches, progressively improving the pipeline. All score
 - **Optuna** Bayesian hyperparameter tuning: 50 trials per model
 - **SMOTE** (k=3) within 10-fold CV
 - **Pseudo-Labeling**: 2 rounds of self-training on high-confidence test predictions
-  - Round 1: pos ≥ 0.90, neg ≤ 0.05
-  - Round 2: pos ≥ 0.85, neg ≤ 0.08
+  - Round 1: pos >= 0.90, neg <= 0.05
+  - Round 2: pos >= 0.85, neg <= 0.08
 - **Nested CV** threshold selection (median from 5-fold inner CV)
 
 | Submission | Private Score | Public Score |
@@ -202,7 +207,7 @@ We explored multiple approaches, progressively improving the pipeline. All score
 
 - **Features**: Same top 60 features as Approach 3, with StandardScaler for MLP
 - **Models**: LightGBM, XGBoost, CatBoost, **MLP** (scikit-learn MLPClassifier, 2-3 hidden layers)
-- **Multi-seed blending**: Each model trained with 3 seeds (42, 123, 456) × 10-fold CV, predictions averaged across seeds for stability
+- **Multi-seed blending**: Each model trained with 3 seeds (42, 123, 456) x 10-fold CV, predictions averaged across seeds for stability
 - **Optuna** tuning for all 4 models (40-50 trials each)
 - **Pseudo-Labeling**: 2 rounds (same thresholds as Approach 3)
 
@@ -212,25 +217,43 @@ We explored multiple approaches, progressively improving the pipeline. All score
 
 > MLP underperformed tree-based models significantly. Multi-seed blending added training cost without improving over Approach 3's focused ensemble.
 
+### Approach 5: Comprehensive Feature Pipeline + Multi-Track GBDT Army + CNN-LSTM
+
+This approach represents a fundamental redesign of the entire pipeline:
+
+- **Features**: 1,300+ features via comprehensive pipeline — SNR/normalized channel injection, FFT, Lomb-Scargle periodogram, power-law decay fit, physical binning, integral features, luminosity correction, rest-frame kinematics, multi-channel color features
+- **GBDT Army**: 9 diverse tracks (different `scale_pos_weight`, seeds, metrics, learning rates) x 4 models (XGBoost, LightGBM, CatBoost, ExtraTrees) = 180 tree models
+- **1D CNN-LSTM**: Multi-scale Inception CNN + BiLSTM + Attention on resampled 12-channel light curves
+- **Hill Climbing**: Simulated annealing optimizer for blend weights (2000 iterations)
+- **Disagreement-based regional thresholding**: per-region F1 threshold optimization based on model disagreement
+
+| Submission | Private Score | Public Score |
+|---|---|---|
+| **GBDT Army (5 tracks)** | **0.5731** | **0.6628** |
+| GBDT Army (9 tracks + feature selection) | 0.5708 | 0.5848 |
+
+> The 5-track version outperformed the 9-track version on public score, suggesting that additional tracks with feature selection introduced slight overfitting. The simpler 5-track army with all 1,300+ features generalized better.
+
 ### Summary
 
-| Approach | Best Private Score | Key Technique |
-|---|---|---|
-| Baseline Ensemble | 0.5268 | Weight-optimized 3-model ensemble |
-| Enhanced Features + Stacking | ~0.5268 | SMOTE + 5-model stacking |
-| **Feature Selection + Optuna + PL** | **0.5481** | Feature selection + HPO + pseudo-labeling |
-| MLP + Multi-Seed | 0.4573 | Neural network + multi-seed blending |
+| Approach | Best Private Score | Best Public Score | Key Technique |
+|---|---|---|---|
+| Baseline Ensemble | 0.5268 | 0.5539 | Weight-optimized 3-model ensemble |
+| Enhanced Features + Stacking | ~0.5268 | ~0.5539 | SMOTE + 5-model stacking |
+| Feature Selection + Optuna + PL | 0.5481 | 0.5643 | Feature selection + HPO + pseudo-labeling |
+| MLP + Multi-Seed | 0.4573 | 0.4545 | Neural network + multi-seed blending |
+| **Multi-Track GBDT Army** | **0.5731** | **0.6628** | Comprehensive features + GBDT army + regional thresholding |
 
-**Best result: F1 = 0.5481** (Private) achieved by the Approach 3 ensemble and its pseudo-labeled variant.
+**Best result: Public F1 = 0.6628, Private F1 = 0.5731** achieved by the Approach 5 multi-track GBDT army.
 
 ### Key Takeaways
 
-- **Feature selection > feature quantity**: Reducing from 267 to 60 features improved generalization
-- **Hyperparameter tuning matters**: Optuna-tuned models significantly outperformed manually-tuned ones
-- **Pseudo-labeling helped slightly**: Round 2 matched the base ensemble; Round 1 was close
-- **Tree-based models dominate**: XGBoost was the strongest single model; MLP was the weakest
-- **CatBoost underperformed** relative to LightGBM and XGBoost on this task
+- **Comprehensive feature engineering is the single largest driver of improvement**: expanding from 150 to 1,300+ features with domain-specific transforms (FFT, Lomb-Scargle, power-law decay, luminosity correction) provided the biggest score jump (+0.10 on public F1)
+- **Channel augmentation amplifies feature diversity**: injecting SNR and normalized shape channels before feature extraction effectively triples the feature space without additional hand-crafting
+- **Multi-track diversity beats single-config tuning**: varying `scale_pos_weight`, evaluation metric, and learning rate across tracks creates genuine ensemble diversity that outperforms a single heavily-tuned model
+- **Feature selection requires caution**: aggressive feature filtering (1,300 -> ~700) slightly hurt generalization in this case, likely because some "low-importance" features contributed useful signal in combination
 - **Threshold optimization is critical** for imbalanced classification — optimal threshold was far below 0.5
+- **Tree-based models dominate** on tabular astronomical features: XGBoost and LightGBM consistently outperform neural network approaches (MLP, CNN-LSTM) when features are well-engineered
 
 ## Project Structure
 
@@ -243,10 +266,13 @@ mallorn-astronomical-classification-challenge/
 │   └── split_01/ ... split_20/          # Light curve data
 │       ├── train_full_lightcurves.csv
 │       └── test_full_lightcurves.csv
-├── mallorn_classification.ipynb         # Approach 1: Baseline ensemble
+├── mallorn_classification.ipynb         # Approach 5: Multi-track GBDT army (best)
 ├── mallorn_classification_v2.ipynb      # Approach 2: Enhanced features + stacking
 ├── mallorn_classification_v3.ipynb      # Approach 3: Feature selection + Optuna + PL
 ├── mallorn_classification_v4.ipynb      # Approach 4: MLP + multi-seed blending
+├── doc/
+│   ├── image.png                        # Kaggle submission screenshot
+│   └── MALLORN_Report.docx             # Detailed report
 ├── requirements.txt                     # Python dependencies
 └── README.MD
 ```
@@ -255,6 +281,8 @@ mallorn-astronomical-classification-challenge/
 
 Upload and run any notebook on Kaggle with the competition dataset attached. Each notebook includes EDA, full training pipeline, and submission generation.
 
+For the best-performing Approach 5 (`mallorn_classification.ipynb`), a GPU runtime is recommended for the CNN-LSTM component, though the GBDT army runs on CPU.
+
 ## Dependencies
 
 - Python 3.12
@@ -262,8 +290,11 @@ Upload and run any notebook on Kaggle with the competition dataset attached. Eac
 - scikit-learn
 - lightgbm
 - xgboost
+- catboost
+- pytorch (for CNN-LSTM)
+- astropy (for luminosity features)
 - matplotlib
-- tqdm
+- tqdm, joblib
 
 ## Analysis
 
@@ -271,4 +302,5 @@ Upload and run any notebook on Kaggle with the competition dataset attached. Eac
 - **TDEs have distinctive light curve morphology**: rapid flux rise followed by a power-law decline, which differs from the stochastic variability of AGN and the plateau behavior of SN II. Features capturing rise/decline asymmetry and variability indices are among the most important.
 - **Multi-band color evolution matters**: TDEs show characteristic blue color that evolves over time, captured by cross-filter peak delays and color features.
 - **Redshift normalization is physically motivated**: dividing flux-based features by redshift accounts for distance effects, making features more comparable across objects at different distances.
-- **Ensemble diversity improves robustness**: LightGBM and XGBoost learn similar gradient-boosted patterns but differ in regularization and splitting strategies, while ExtraTrees provides a complementary randomized approach that reduces overfitting on the small TDE sample.
+- **Ensemble diversity improves robustness**: combining models with different architectures (XGBoost, LightGBM, CatBoost, ExtraTrees), different hyperparameters, and different optimization targets creates a more robust final prediction than any single model.
+- **Disagreement-based routing is effective**: samples where models agree strongly can be classified with higher confidence, while samples with high inter-model disagreement benefit from more conservative thresholds.
